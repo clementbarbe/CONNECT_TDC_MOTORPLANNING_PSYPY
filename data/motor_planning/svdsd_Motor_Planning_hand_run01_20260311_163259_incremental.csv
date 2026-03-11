@@ -1,0 +1,14 @@
+action,condition,effector,event_index,label,onset_actual_s,onset_planned_s,participant,pin_code,plan_duration_s,run_number,scheduling_error_ms,session,sound_id,trial_duration_s,trial_index
+visual_fixation,,hand,0,baseline_start,0.103843,0.0,svdsd,,,1,103.843,01,,,
+marker,,hand,1,run_start,0.104081,0.0,svdsd,,,1,104.081,01,,,
+visual_fixation,touch,hand,2,preview_start,10.045408,10.0,svdsd,,,1,45.408,01,,,1
+marker,touch,hand,3,trial_start,10.045544,10.0,svdsd,,5.624,1,45.544,01,,,1
+sound_cue,touch,hand,4,cue_touch,12.057565,12.0,svdsd,20,,1,57.565,01,touch,,1
+sound_go,touch,hand,5,go_beep,17.624499,17.623811,svdsd,40,,1,0.688,01,go,,1
+marker,touch,hand,6,execute_start,17.624903,17.624811,svdsd,,,1,0.092,01,,,1
+marker,touch,hand,7,iti_start,19.623963,19.623811,svdsd,,,1,0.152,01,,,1
+visual_fixation,,hand,8,iti_fixation,19.662726,19.626811,svdsd,,,1,35.915,01,,,1
+visual_fixation,grasp,hand,9,preview_start,27.635208,27.623811,svdsd,,,1,11.397,01,,,2
+marker,touch,hand,10,trial_end,27.63535,27.623811,svdsd,,,1,11.539,01,,17.624,1
+marker,grasp,hand,11,trial_start,27.635573,27.623811,svdsd,,5.831,1,11.762,01,,,2
+sound_cue,grasp,hand,12,cue_grasp,29.62473,29.623811,svdsd,10,,1,0.919,01,grasp,,2

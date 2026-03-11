@@ -19,7 +19,6 @@ def show_menu_and_get_config(app, last_config=None):
 
 def run_task_logic(config):
     logger = get_logger()
-
     from psychopy import visual, core, logging
     from utils.task_factory import create_task
 

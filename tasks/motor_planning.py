@@ -13,6 +13,12 @@ ARCHITECTURE : PRE-COMPUTED TIMELINE
    reste.
 3. Zéro calcul de séquence ou de jitter pendant l'acquisition.
 
+AUDIO : soundfile + sounddevice (PsychoPy-free)
+────────────────────────────────────────────────
+Tous les buffers audio sont pré-chargés en mémoire (numpy arrays) à
+l'init. Pendant le run, sd.play() est non-bloquant et démarre en ~0.5 ms.
+Aucun fichier n'est ouvert pendant l'acquisition.
+
 Structure d'un essai :
     Preview  →  Cue (« Grasp » / « Touch »)  →  Plan (5.5 s ± 0.5 s)
              →  Go beep  →  Execute (2 s)  →  ITI (8 s)
@@ -38,8 +44,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
 from psychopy import core, visual
-from psychopy import sound as psysound
 from utils.base_task import BaseTask
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -48,6 +57,9 @@ from utils.base_task import BaseTask
 
 CONDITIONS: List[str] = ["grasp", "touch"]
 EFFECTORS:  List[str] = ["hand", "tool"]
+
+# Sample rate pour les tons synthétiques (fallback)
+SYNTH_SR: int = 44100
 
 # Codes port parallèle pour marqueurs EEG (personnalisables via __init__)
 DEFAULT_EVENT_CODES: Dict[str, int] = {
@@ -65,13 +77,51 @@ DEFAULT_EVENT_CODES: Dict[str, int] = {
 
 # Priorité de tri quand plusieurs événements partagent le même onset
 _ACTION_PRIORITY: Dict[str, int] = {
-    "visual_fixation":     0,   # flip d'abord
+    "visual_fixation":     0,
     "visual_instruction":  0,
-    "parport_event":       1,   # puis triggers EEG
-    "sound_cue":           2,   # puis sons (haute précision)
+    "parport_event":       1,
+    "sound_cue":           2,
     "sound_go":            2,
-    "marker":              3,   # puis marqueurs logiques
+    "marker":              3,
 }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIO HELPERS (module-level, aucune dépendance PsychoPy)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _load_wav(path: str) -> tuple:
+    """
+    Charge un fichier WAV via soundfile.
+    Returns (data_float32, samplerate).
+    """
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    return data, sr
+
+
+def _generate_tone(
+    freq_hz: float, duration_s: float, sr: int = SYNTH_SR,
+    amplitude: float = 0.7, fade_ms: float = 5.0,
+) -> tuple:
+    """
+    Génère un ton pur stéréo (numpy float32) avec fade-in/out.
+    Returns (data_float32, samplerate).
+    """
+    n_samples = int(sr * duration_s)
+    t = np.linspace(0, duration_s, n_samples, endpoint=False, dtype=np.float32)
+    mono = amplitude * np.sin(2 * np.pi * freq_hz * t)
+
+    # Fade in/out pour éviter les clics
+    fade_samples = int(sr * fade_ms / 1000.0)
+    if fade_samples > 0 and fade_samples < n_samples // 2:
+        fade_in = np.linspace(0, 1, fade_samples, dtype=np.float32)
+        fade_out = np.linspace(1, 0, fade_samples, dtype=np.float32)
+        mono[:fade_samples] *= fade_in
+        mono[-fade_samples:] *= fade_out
+
+    # Stéréo
+    stereo = np.column_stack([mono, mono])
+    return stereo, sr
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -87,9 +137,6 @@ class MotorPlanning(BaseTask):
         dans les données. Constant pour tout le run.
     run_number : int
         Numéro du run (1-8), assigné depuis le menu.
-    plan_duration : float
-        Durée totale de la phase Plan **depuis l'onset du cue** jusqu'à
-        l'onset du go beep (en secondes). Jittée ± plan_jitter.
     """
 
     def __init__(
@@ -118,6 +165,9 @@ class MotorPlanning(BaseTask):
         grasp_sound_file: str = "grasp.wav",
         touch_sound_file: str = "touch.wav",
         go_beep_freq: float = 1000.0,
+        # ── audio device ──
+        audio_device: Optional[int] = 12,
+        audio_latency: str = "low",
         # ── misc ──
         enregistrer: bool = True,
         eyetracker_actif: bool = False,
@@ -164,6 +214,10 @@ class MotorPlanning(BaseTask):
         self.touch_sound_file: str   = touch_sound_file
         self.go_beep_freq: float     = go_beep_freq
 
+        # ── audio device ─────────────────────────────────────────────────
+        self.audio_device: Optional[int] = audio_device
+        self.audio_latency: str          = audio_latency
+
         # ── event codes EEG ──────────────────────────────────────────────
         self.event_codes: Dict[str, int] = (
             event_codes if event_codes else dict(DEFAULT_EVENT_CODES)
@@ -174,6 +228,10 @@ class MotorPlanning(BaseTask):
 
         # ═══ PRE-COMPUTED TIMELINE ═══
         self.timeline: List[Dict[str, Any]] = []
+
+        # ── Audio buffers (remplis dans _setup_sounds) ───────────────────
+        self._audio_buffers: Dict[str, np.ndarray] = {}
+        self._audio_sr: int = SYNTH_SR
 
         # ── init chain ───────────────────────────────────────────────────
         self._detect_display_scaling()
@@ -232,54 +290,121 @@ class MotorPlanning(BaseTask):
     # =====================================================================
 
     def _setup_visual_stimuli(self) -> None:
-        """Le fixation cross est déjà créé dans BaseTask._init_common_stimuli().
-        On ajoute ici le TextStim pour les instructions visuelles inter-blocs."""
         self.cue_stim = visual.TextStim(
             self.win, text="", height=0.06, color="white",
             pos=(0.0, 0.0), wrapWidth=1.5, font="Arial", bold=False,
         )
 
     # =====================================================================
-    #  SOUND SETUP
+    #  SOUND SETUP — soundfile + sounddevice (NO PsychoPy)
     # =====================================================================
 
     def _setup_sounds(self) -> None:
-        """Pré-charge tous les stimuli auditifs. Fallback = tons purs."""
+        """
+        Pré-charge TOUS les stimuli auditifs en mémoire comme des
+        numpy arrays float32 stéréo. Pendant le run, sd.play()
+        envoie directement le buffer au DAC — aucun I/O fichier.
+        """
+        # ── Configurer sounddevice ──
+        if self.audio_device is not None:
+            sd.default.device = self.audio_device
+            self.logger.log(f"Audio device set to: {self.audio_device}")
+        sd.default.latency = self.audio_latency
+
+        self.logger.log(
+            f"sounddevice config: device={sd.default.device}, "
+            f"latency={sd.default.latency}"
+        )
+
+        # ── Lister les devices disponibles (debug) ──
+        try:
+            dev_info = sd.query_devices()
+            self.logger.log(f"Audio devices:\n{dev_info}")
+        except Exception as e:
+            self.logger.warn(f"Could not query audio devices: {e}")
+
         base = Path(self.root_dir) / self.sound_dir
         grasp_path = base / self.grasp_sound_file
         touch_path = base / self.touch_sound_file
 
         # ── Cue « Grasp » ──
         if grasp_path.exists():
-            self.sound_grasp = psysound.Sound(str(grasp_path))
-            self.logger.log(f"Loaded grasp sound: {grasp_path}")
-        else:
-            self.sound_grasp = psysound.Sound(
-                value=400, secs=self.cue_duration, stereo=True,
+            data, sr = _load_wav(str(grasp_path))
+            self._audio_buffers["grasp"] = data
+            self._audio_sr = sr
+            self.logger.ok(
+                f"Loaded grasp sound: {grasp_path} "
+                f"({len(data)} samples, {sr} Hz, "
+                f"{len(data)/sr:.2f} s)"
             )
+        else:
+            data, sr = _generate_tone(400, self.cue_duration)
+            self._audio_buffers["grasp"] = data
+            self._audio_sr = sr
             self.logger.warn(
-                f"Grasp WAV not found ({grasp_path}), using 400 Hz tone."
+                f"Grasp WAV not found ({grasp_path}), "
+                f"using 400 Hz tone ({self.cue_duration} s)."
             )
 
         # ── Cue « Touch » ──
         if touch_path.exists():
-            self.sound_touch = psysound.Sound(str(touch_path))
-            self.logger.log(f"Loaded touch sound: {touch_path}")
-        else:
-            self.sound_touch = psysound.Sound(
-                value=600, secs=self.cue_duration, stereo=True,
+            data, sr = _load_wav(str(touch_path))
+            self._audio_buffers["touch"] = data
+            # Utiliser le sr du premier fichier chargé si identique
+            if sr != self._audio_sr:
+                self.logger.warn(
+                    f"Touch WAV samplerate ({sr}) differs from "
+                    f"reference ({self._audio_sr}). Using {sr}."
+                )
+                self._audio_sr = sr
+            self.logger.ok(
+                f"Loaded touch sound: {touch_path} "
+                f"({len(data)} samples, {sr} Hz, "
+                f"{len(data)/sr:.2f} s)"
             )
+        else:
+            data, sr = _generate_tone(600, self.cue_duration)
+            self._audio_buffers["touch"] = data
             self.logger.warn(
-                f"Touch WAV not found ({touch_path}), using 600 Hz tone."
+                f"Touch WAV not found ({touch_path}), "
+                f"using 600 Hz tone ({self.cue_duration} s)."
             )
 
         # ── Go beep ──
-        self.sound_go = psysound.Sound(
-            value=self.go_beep_freq, secs=self.go_duration, stereo=True,
+        data, sr = _generate_tone(
+            self.go_beep_freq, self.go_duration, self._audio_sr
         )
-        self.logger.log(
-            f"Go beep: {self.go_beep_freq} Hz, {self.go_duration} s"
+        self._audio_buffers["go"] = data
+        self.logger.ok(
+            f"Go beep generated: {self.go_beep_freq} Hz, "
+            f"{self.go_duration} s, {self._audio_sr} Hz"
         )
+
+        # ── Test silencieux pour « chauffer » le driver ──
+        try:
+            silence = np.zeros((int(self._audio_sr * 0.01), 2),
+                               dtype=np.float32)
+            sd.play(silence, samplerate=self._audio_sr)
+            sd.wait()
+            self.logger.ok("Audio driver primed (silent warmup).")
+        except Exception as e:
+            self.logger.warn(f"Audio warmup failed: {e}")
+
+    def _play_sound(self, sound_id: str) -> None:
+        """
+        Lance la lecture non-bloquante d'un buffer audio pré-chargé.
+        sd.play() est non-bloquant : il envoie le buffer au stream
+        et retourne immédiatement (~0.2-0.5 ms).
+        """
+        buf = self._audio_buffers.get(sound_id)
+        if buf is None:
+            self.logger.warn(f"Audio buffer not found: {sound_id}")
+            return
+        try:
+            sd.stop()                             # coupe tout son en cours
+            sd.play(buf, samplerate=self._audio_sr)  # non-bloquant
+        except Exception as e:
+            self.logger.err(f"sd.play() error for '{sound_id}': {e}")
 
     # =====================================================================
     #  SEQUENCE GENERATION
@@ -289,7 +414,6 @@ class MotorPlanning(BaseTask):
     def _pseudo_random_no_repeat(
         items: List[str], reps: int, max_attempts: int = 500,
     ) -> List[str]:
-        """Séquence pseudo-aléatoire sans répétition immédiate."""
         pool = [it for it in items for _ in range(reps)]
         for _ in range(max_attempts):
             seq: List[str] = []
@@ -312,7 +436,6 @@ class MotorPlanning(BaseTask):
         return pool
 
     def _build_trial_order(self) -> List[str]:
-        """20 grasp + 20 touch, pas de répétition immédiate."""
         return self._pseudo_random_no_repeat(
             CONDITIONS, self.n_trials_per_condition,
         )
@@ -324,7 +447,6 @@ class MotorPlanning(BaseTask):
     def _add_event(
         self, onset_s: float, action: str, **kwargs: Any,
     ) -> None:
-        """Ajoute un événement à la timeline pré-calculée."""
         event: Dict[str, Any] = {
             "onset_s":   round(onset_s, 6),
             "action":    action,
@@ -343,18 +465,16 @@ class MotorPlanning(BaseTask):
         flip_lead_s: float,
     ) -> float:
         """
-        Ajoute tous les événements pour UN essai dans la timeline.
+        Ajoute tous les événements pour UN essai.
 
         Chronologie depuis t (trial_start) :
-            t + 0                           : trial_start marker + fixation flip
-            t + preview_duration            : cue sound (« grasp » / « touch »)
-            t + preview_duration + plan_dur : go beep
-            t + preview_duration + plan_dur + execute_dur : ITI
-            t + preview_duration + plan_dur + execute_dur + iti_dur : trial_end
+            t + 0                                     : trial_start + fixation
+            t + preview_duration                      : cue sound
+            t + preview_duration + plan_dur (jitté)   : go beep
+            t + preview_duration + plan_dur + exec    : ITI
+            t + preview_duration + plan_dur + exec + iti : trial_end
 
-        Returns
-        -------
-        float : onset du prochain essai (= trial_end).
+        Returns : onset du prochain essai.
         """
         trial_start_t = t
 
@@ -362,7 +482,7 @@ class MotorPlanning(BaseTask):
         jitter = random.uniform(-self.plan_jitter, self.plan_jitter)
         plan_dur = max(2.0, self.plan_duration + jitter)
 
-        # ── TRIAL START ──────────────────────────────────────────────────
+        # ── TRIAL START ──
         self._add_event(
             t, "marker",
             label="trial_start",
@@ -380,10 +500,7 @@ class MotorPlanning(BaseTask):
                 pin_code=self.event_codes.get("trial_start", 1),
             )
 
-        # ── PREVIEW PHASE : fixation (flip lead avant le premier son) ──
-        # Le flip est 2 frames AVANT le premier son pour ne pas bloquer.
-        # Si preview_dur > flip_lead, on planifie le flip à t ;
-        # le prochain son est à t + preview_dur — largement suffisant.
+        # ── PREVIEW : fixation ──
         self._add_event(
             t, "visual_fixation",
             label="preview_start",
@@ -400,7 +517,7 @@ class MotorPlanning(BaseTask):
 
         t_cue = trial_start_t + self.preview_duration
 
-        # ── AUDITORY CUE (« Grasp » / « Touch ») → début Plan ───────────
+        # ── AUDITORY CUE → début Plan ──
         cue_code_key = f"cue_{condition}"
         self._add_event(
             t_cue, "sound_cue",
@@ -411,7 +528,7 @@ class MotorPlanning(BaseTask):
             pin_code=self.event_codes.get(cue_code_key, 10),
         )
 
-        # ── GO BEEP → début Execute ─────────────────────────────────────
+        # ── GO BEEP → début Execute ──
         t_go = t_cue + plan_dur
         go_code_key = f"go_{condition}"
         self._add_event(
@@ -419,6 +536,7 @@ class MotorPlanning(BaseTask):
             label="go_beep",
             trial_index=trial_idx,
             condition=condition,
+            sound_id="go",
             pin_code=self.event_codes.get(go_code_key, 30),
         )
         self._add_event(
@@ -435,7 +553,7 @@ class MotorPlanning(BaseTask):
                 pin_code=self.event_codes.get("execute_start", 50),
             )
 
-        # ── ITI ─────────────────────────────────────────────────────────
+        # ── ITI ──
         t_iti = t_go + self.execute_duration
 
         self._add_event(
@@ -451,14 +569,13 @@ class MotorPlanning(BaseTask):
                 trial_index=trial_idx,
                 pin_code=self.event_codes.get("iti_start", 60),
             )
-        # Refresh de l'écran (fixation) pour maintenir l'affichage
         self._add_event(
             t_iti + 0.003, "visual_fixation",
             label="iti_fixation",
             trial_index=trial_idx,
         )
 
-        # ── TRIAL END ───────────────────────────────────────────────────
+        # ── TRIAL END ──
         t_end = t_iti + self.iti_duration
 
         self._add_event(
@@ -471,12 +588,9 @@ class MotorPlanning(BaseTask):
 
         return t_end
 
-    # ── Construction complète de la timeline ─────────────────────────────
+    # ── Construction complète ────────────────────────────────────────────
 
     def _build_full_timeline(self) -> None:
-        """
-        Construit la timeline complète AVANT le trigger de démarrage.
-        """
         self.timeline.clear()
 
         trial_order = self._build_trial_order()
@@ -484,7 +598,7 @@ class MotorPlanning(BaseTask):
 
         flip_lead_s = 2.0 * self.frame_duration_s
 
-        # ── Run start ────────────────────────────────────────────────────
+        # ── Run start ──
         self._add_event(
             t, "marker", label="run_start",
             effector=self.effector,
@@ -499,21 +613,21 @@ class MotorPlanning(BaseTask):
                 pin_code=self.event_codes.get("run_start", 100),
             )
 
-        # ── Baseline initiale : fixation ─────────────────────────────────
+        # ── Baseline initiale ──
         self._add_event(t, "visual_fixation", label="baseline_start")
         t += self.initial_baseline
 
-        # ── Essais ───────────────────────────────────────────────────────
+        # ── Essais ──
         for trial_idx, condition in enumerate(trial_order, start=1):
             t = self._build_trial_events(
                 t, trial_idx, condition, flip_lead_s,
             )
 
-        # ── Baseline finale ──────────────────────────────────────────────
+        # ── Baseline finale ──
         self._add_event(t, "visual_fixation", label="final_baseline_start")
         t += self.final_baseline
 
-        # ── Run end ──────────────────────────────────────────────────────
+        # ── Run end ──
         self._add_event(t, "marker", label="run_end")
         if self.parport_actif:
             self._add_event(
@@ -522,14 +636,12 @@ class MotorPlanning(BaseTask):
                 pin_code=self.event_codes.get("run_end", 200),
             )
 
-        # ── Tri stable : onset, puis priorité ────────────────────────────
+        # ── Tri stable ──
         self.timeline.sort(key=lambda e: (e["onset_s"], e["_priority"]))
 
-        # Numérotation séquentielle
         for i, evt in enumerate(self.timeline):
             evt["event_index"] = i
 
-        # Validation
         self._validate_no_flip_sound_collision()
 
         # Résumé
@@ -553,10 +665,6 @@ class MotorPlanning(BaseTask):
         )
 
     def _validate_no_flip_sound_collision(self) -> None:
-        """
-        Vérifie qu'aucun flip bloquant n'est planifié au même onset
-        qu'un événement sonore critique.
-        """
         visual_onsets = set()
         sound_onsets  = set()
 
@@ -570,8 +678,7 @@ class MotorPlanning(BaseTask):
         if collisions:
             self.logger.err(
                 f"TIMELINE BUG: {len(collisions)} flip/sound collisions "
-                f"detected! First at t={min(collisions):.3f} s. "
-                f"Flips could delay sound onsets."
+                f"detected! First at t={min(collisions):.3f} s."
             )
         else:
             self.logger.ok(
@@ -581,7 +688,6 @@ class MotorPlanning(BaseTask):
     # ── Sauvegarde planned ───────────────────────────────────────────────
 
     def _save_planned_timeline(self) -> None:
-        """Sauvegarde la timeline pré-calculée avant exécution."""
         if not self.enregistrer or not self.timeline:
             return
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -611,20 +717,12 @@ class MotorPlanning(BaseTask):
             self.logger.err(f"Failed to save planned timeline: {e}")
 
     # ═════════════════════════════════════════════════════════════════════
-    #  TIMELINE EXECUTION — Moteur temps-réel minimal
+    #  TIMELINE EXECUTION
     # ═════════════════════════════════════════════════════════════════════
 
     def _wait_until(
         self, target_s: float, high_precision: bool = False,
     ) -> None:
-        """
-        Attend jusqu'à target_s sur task_clock.
-
-        high_precision=True (sons) :
-            Sleep pour le gros, spin-wait pour les 2 dernières ms.
-        high_precision=False (visuels, marqueurs) :
-            core.wait standard (suffisant).
-        """
         remaining = target_s - self.task_clock.getTime()
         if remaining <= 0:
             return
@@ -641,12 +739,13 @@ class MotorPlanning(BaseTask):
         """
         Exécute l'action d'un événement. Retourne le temps réel.
 
-        Pour les sons : trigger EEG d'abord (µs), puis play() (~0.5 ms).
-        Le marqueur EEG est donc aligné au mieux avec l'onset sonore.
+        Pour les sons :
+          1) trigger EEG via port parallèle (~µs)
+          2) sd.play() non-bloquant (~0.2-0.5 ms)
         """
         action = event["action"]
 
-        # ── Visuels ──────────────────────────────────────────────────────
+        # ── Visuels ──
         if action == "visual_fixation":
             self.fixation.draw()
             self.win.flip()
@@ -659,36 +758,27 @@ class MotorPlanning(BaseTask):
             self.win.flip()
             return self.task_clock.getTime()
 
-        # ── Son : cue (« Grasp » / « Touch ») ───────────────────────────
+        # ── Son : cue (« Grasp » / « Touch ») ──
         if action == "sound_cue":
-            # 1) Trigger EEG (le plus rapide, ~µs)
             if self.parport_actif:
                 self.ParPort.send_trigger(event.get("pin_code", 0))
-            # 2) Play son
-            snd = (
-                self.sound_grasp
-                if event.get("sound_id") == "grasp"
-                else self.sound_touch
-            )
-            snd.stop()   # reset si encore en lecture
-            snd.play()
+            self._play_sound(event.get("sound_id", "grasp"))
             return self.task_clock.getTime()
 
-        # ── Son : go beep ────────────────────────────────────────────────
+        # ── Son : go beep ──
         if action == "sound_go":
             if self.parport_actif:
                 self.ParPort.send_trigger(event.get("pin_code", 0))
-            self.sound_go.stop()
-            self.sound_go.play()
+            self._play_sound("go")
             return self.task_clock.getTime()
 
-        # ── Trigger EEG seul ─────────────────────────────────────────────
+        # ── Trigger EEG seul ──
         if action == "parport_event":
             if self.parport_actif:
                 self.ParPort.send_trigger(event.get("pin_code", 0))
             return self.task_clock.getTime()
 
-        # ── Marqueur logique (pas d'action hardware) ─────────────────────
+        # ── Marqueur logique ──
         if action == "marker":
             return self.task_clock.getTime()
 
@@ -699,7 +789,6 @@ class MotorPlanning(BaseTask):
     def _build_execution_record(
         self, event: Dict[str, Any], actual_time_s: float,
     ) -> Dict[str, Any]:
-        """Construit l'enregistrement pour UN événement exécuté."""
         error_ms = (actual_time_s - event["onset_s"]) * 1000.0
         return {
             "participant":         self.nom,
@@ -723,38 +812,28 @@ class MotorPlanning(BaseTask):
     # ── Boucle principale ────────────────────────────────────────────────
 
     def _execute_timeline(self) -> None:
-        """
-        Parcourt la timeline pré-calculée. Seule boucle active pendant
-        l'acquisition EEG.
-        """
         n_events = len(self.timeline)
         self.logger.log(f"Executing timeline: {n_events} events …")
 
-        # ══ GC désactivé pour tout le run ══
         gc.disable()
 
         try:
             for i, event in enumerate(self.timeline):
 
-                # ── Quit check sur événements non-critiques ──
                 is_sound = event["action"].startswith("sound_")
                 if not is_sound:
                     self.should_quit()
 
-                # ── Attente de l'onset ──
                 self._wait_until(
                     event["onset_s"], high_precision=is_sound,
                 )
 
-                # ── Exécution ──
                 actual_t = self._dispatch_event(event)
 
-                # ── Enregistrement ──
                 record = self._build_execution_record(event, actual_t)
                 self.global_records.append(record)
                 self.save_trial_incremental(record)
 
-                # ── Eyetracker ──
                 if self.eyetracker_actif:
                     label = event.get("label", event["action"])
                     self.EyeTracker.send_message(
@@ -763,7 +842,6 @@ class MotorPlanning(BaseTask):
                         f"{label.upper()}"
                     )
 
-                # ── Alerte timing (sons uniquement, seuil > 1 ms) ──
                 if is_sound:
                     err_ms = record["scheduling_error_ms"]
                     if abs(err_ms) > 1.0:
@@ -774,7 +852,6 @@ class MotorPlanning(BaseTask):
                             f"{err_ms:+.2f} ms"
                         )
 
-                # ── Log de progression ──
                 if event.get("label") == "trial_end":
                     t_idx = event.get("trial_index", "?")
                     cond  = event.get("condition", "?")
@@ -840,12 +917,11 @@ class MotorPlanning(BaseTask):
             raise
 
         finally:
-            # Arrêt sécurisé des sons
-            for snd in (self.sound_grasp, self.sound_touch, self.sound_go):
-                try:
-                    snd.stop()
-                except Exception:
-                    pass
+            # Arrêt propre de sounddevice
+            try:
+                sd.stop()
+            except Exception:
+                pass
 
             if self.eyetracker_actif:
                 self.EyeTracker.stop_recording()
