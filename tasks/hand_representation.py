@@ -3,17 +3,13 @@
 Hand Representation Task
 ========================
 
-Tâche simple de localisation / acquisition photo basée sur une image
-de la main présentant une zone cible à sélectionner mentalement / poser.
-
 Principe :
     - 10 positions au total (2 zones x 5 doigts)
-    - 1 block = 100 trials
-    - 10 miniblocks de 10 trials
+    - 1 block = 100 trials, 10 miniblocks de 10 trials
     - chaque miniblock contient les 10 positions une fois, ordre randomisé
     - à chaque trial :
         1) affichage image cible (miroir si main gauche)
-        2) progress bar continue 7 sec (noire sur fond gris)
+        2) progress bar 7 sec (noire sur fond gris)
         3) acquisition webcam
         4) sauvegarde photo + log CSV
 """
@@ -45,6 +41,14 @@ class HandRepresentationTask(BaseTask):
     ]
 
     BACKGROUND_COLOR = [0, 0, 0]
+
+    # Barre de progression : géométrie en coordonnées norm
+    BAR_Y = -0.75
+    BAR_LEFT = -0.59
+    BAR_MAX_WIDTH = 1.18
+    BAR_TRACK_W = 1.2
+    BAR_TRACK_H = 0.08
+    BAR_FILL_H = 0.06
 
     def __init__(self, win, nom, session='01',
                  n_blocks=1,
@@ -132,22 +136,22 @@ class HandRepresentationTask(BaseTask):
         # Piste (fond de la barre) — gris clair
         self.progress_track = visual.Rect(
             self.win,
-            width=1.2,
-            height=0.08,
-            pos=(0, -0.75),
+            width=self.BAR_TRACK_W,
+            height=self.BAR_TRACK_H,
+            pos=(0, self.BAR_Y),
             lineColor=[0.6, 0.6, 0.6],
             lineWidth=2,
             fillColor=[0.3, 0.3, 0.3]
         )
 
-        # Remplissage noir — ShapeStim pour un contrôle pixel-précis
-        # On dessine un quad dont le bord droit bouge chaque frame
-        self.progress_fill = visual.ShapeStim(
+        # Remplissage noir — Rect classique, PAS de anchor
+        self.progress_fill = visual.Rect(
             self.win,
-            vertices=[(-0.59, -0.72), (-0.59, -0.78), (-0.59, -0.78), (-0.59, -0.72)],
-            fillColor=[-1, -1, -1],
+            width=0.001,
+            height=self.BAR_FILL_H,
+            pos=(self.BAR_LEFT, self.BAR_Y),
             lineColor=None,
-            closeShape=True
+            fillColor=[-1, -1, -1]
         )
 
     def _preload_images(self):
@@ -220,30 +224,20 @@ class HandRepresentationTask(BaseTask):
         )
         self.show_instructions(text_override=txt)
 
-    def _update_progress_vertices(self, progress):
-        """
-        Met à jour les vertices du ShapeStim pour un remplissage
-        parfaitement continu (résolution sub-pixel chaque frame).
-
-        progress : float 0.0 → 1.0
-        """
-        left = -0.59
-        right = left + 1.18 * progress
-        top = -0.72
-        bottom = -0.78
-
-        self.progress_fill.vertices = [
-            (left,  top),
-            (right, top),
-            (right, bottom),
-            (left,  bottom),
-        ]
-
     def _draw_progress_screen(self, image_path, elapsed, duration):
+        """
+        Dessine image + barre de progression.
+        Le Rect de remplissage est repositionné par son centre
+        pour grandir vers la droite depuis BAR_LEFT.
+        """
         progress = min(max(elapsed / duration, 0.0), 1.0)
+        fill_w = max(0.001, self.BAR_MAX_WIDTH * progress)
+        fill_cx = self.BAR_LEFT + fill_w * 0.5
 
         self.image_stim.image = image_path
-        self._update_progress_vertices(progress)
+
+        self.progress_fill.width = fill_w
+        self.progress_fill.pos = (fill_cx, self.BAR_Y)
 
         self.image_stim.draw()
         self.progress_track.draw()
@@ -368,10 +362,8 @@ class HandRepresentationTask(BaseTask):
         print("=" * 60)
 
         self.logger.log(f"START BLOCK {block_idx + 1}")
-
         for trial in trials:
             self.run_trial(trial, total_trials)
-
         self.logger.log(f"END BLOCK {block_idx + 1}")
 
     # =========================================================================
