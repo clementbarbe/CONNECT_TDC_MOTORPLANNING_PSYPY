@@ -48,8 +48,9 @@ CALIBRATION_CONFIGS = {
     },
 }
 
-DISPLAY_W = 960
-DISPLAY_H = 540
+RATIO = 0.8
+DISPLAY_W = round(1920 * RATIO)
+DISPLAY_H = round(1080 * RATIO)
 
 
 class CalibrationWindow(QMainWindow):
