@@ -6,6 +6,7 @@ import sys
 
 # Direct imports for task tabs
 from gui.tabs.tabs_hand import HandRepresentationTab
+from gui.tabs.tabs_calibration import CameraCalibrationTab
 from utils.utils import is_valid_name
 from utils.logger import get_logger
 
@@ -78,7 +79,9 @@ class ExperimentMenu(QMainWindow):
 
     def create_task_tabs(self, parent_layout):
         self.tabs = QTabWidget()
+        self.tabs.addTab(CameraCalibrationTab(self), "Calibration")
         self.tabs.addTab(HandRepresentationTab(self), "Hand Representation")
+        
         
 
         parent_layout.addWidget(self.tabs)
