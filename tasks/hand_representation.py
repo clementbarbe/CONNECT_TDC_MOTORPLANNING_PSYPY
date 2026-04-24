@@ -85,7 +85,6 @@ class HandRepresentationTask(BaseTask):
 
     BACKGROUND_COLOR = [0, 0, 0]
 
-    # Anatomical mirror applied to finger names when the image is flipped.
     FINGER_FLIP_MAP = {
         "thumb":  "little",
         "index":  "ring",
@@ -103,9 +102,10 @@ class HandRepresentationTask(BaseTask):
     BAR_FILL_H    = 0.06
 
     # ── NEW ──────────────────────────────────────────────────────────────────
-    # Duration (s) of the "return to base" screen shown after each trial photo.
     BASE_RETURN_DURATION = 2.0
     # ─────────────────────────────────────────────────────────────────────────
+    CAPTURE_WIDTH  = 1920
+    CAPTURE_HEIGHT = 1080
 
     # =========================================================================
     # CONSTRUCTOR
@@ -275,6 +275,25 @@ class HandRepresentationTask(BaseTask):
         self.camera = cv2.VideoCapture(self.camera_index)
         if not self.camera.isOpened():
             raise RuntimeError(f"Cannot open webcam at index {self.camera_index}.")
+
+        # ── Force Full HD resolution ──────────────────────────────────────────
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH,  self.CAPTURE_WIDTH)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAPTURE_HEIGHT)
+
+        # Read back the resolution actually granted by the driver/hardware
+        actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if actual_w != self.CAPTURE_WIDTH or actual_h != self.CAPTURE_HEIGHT:
+            self.logger.warn(
+                f"Requested {self.CAPTURE_WIDTH}×{self.CAPTURE_HEIGHT} "
+                f"but camera returned {actual_w}×{actual_h}. "
+                "Check that your webcam supports 1080p."
+            )
+        else:
+            self.logger.ok(f"Webcam resolution set to {actual_w}×{actual_h} (Full HD).")
+        # ─────────────────────────────────────────────────────────────────────
+
         ret, frame = self.camera.read()
         if not ret or frame is None:
             self.camera.release()
