@@ -24,9 +24,12 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui  import QImage, QPixmap
 
 
+# ── Résolution imposée à la caméra ───────────────────────────────────────────
+CAMERA_W = 1920
+CAMERA_H = 1080
+CAMERA_FPS = 10
+
 # ── Configurations physiques ──────────────────────────────────────────────────
-# ► Ajuster x_mm / y_mm selon vos marqueurs réels.
-# ► x_rel / y_rel : position souhaitée dans l'image (0.0 → 1.0)
 CALIBRATION_CONFIGS = {
     "table": {
         "label": "Table",
@@ -48,9 +51,32 @@ CALIBRATION_CONFIGS = {
     },
 }
 
-RATIO = 0.8
-DISPLAY_W = round(1920 * RATIO)
-DISPLAY_H = round(1080 * RATIO)
+RATIO     = 0.8
+DISPLAY_W = round(CAMERA_W * RATIO)   # 1536
+DISPLAY_H = round(CAMERA_H * RATIO)   # 864
+
+
+def _open_camera(index: int) -> cv2.VideoCapture:
+    """Ouvre la caméra et force la résolution 1920×1080 @ 30 fps."""
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        return cap                          # l'appelant vérifie isOpened()
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+    cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
+
+    # Vérification : log si la caméra n'a pas accepté la résolution demandée
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if (actual_w, actual_h) != (CAMERA_W, CAMERA_H):
+        print(
+            f"[CALIB] Résolution demandée {CAMERA_W}×{CAMERA_H}, "
+            f"obtenue {actual_w}×{actual_h} (caméra non compatible ?)",
+            file=sys.stderr,
+        )
+
+    return cap
 
 
 class CalibrationWindow(QMainWindow):
@@ -66,7 +92,7 @@ class CalibrationWindow(QMainWindow):
         self.output_path = output_path
         self.confirmed   = False
 
-        # Positions fixes des 4 croix en pixels affichage
+        # Positions des 4 croix en pixels d'affichage
         self.dot_px = [
             (int(p["x_rel"] * DISPLAY_W), int(p["y_rel"] * DISPLAY_H))
             for p in self.config["physical_points"]
@@ -98,7 +124,15 @@ class CalibrationWindow(QMainWindow):
         )
         lay.addWidget(title)
 
-        # Instruction
+        # Résolution & instruction
+        res_label = QLabel(
+            f"Flux caméra : {CAMERA_W}×{CAMERA_H} px  "
+            f"(affiché à {DISPLAY_W}×{DISPLAY_H})"
+        )
+        res_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        res_label.setStyleSheet("font-size:11px; color:#88aaff; padding:2px;")
+        lay.addWidget(res_label)
+
         instr = QLabel(
             "Ajustez physiquement la caméra jusqu'à ce que les croix rouges\n"
             "coïncident exactement avec vos marqueurs, puis cliquez sur Confirmer."
@@ -169,13 +203,15 @@ class CalibrationWindow(QMainWindow):
         for i, (x, y) in enumerate(self.dot_px):
             p = self.config["physical_points"][i]
 
-            # Croix blanche
-            cv2.line(frame, (x - 26, y),     (x + 26, y),     (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.line(frame, (x,      y - 26), (x,      y + 26), (255, 255, 255), 1, cv2.LINE_AA)
+            # Grande croix blanche
+            cross_size = 15
+            cv2.line(frame, (x - cross_size, y),      (x + cross_size, y),      (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.line(frame, (x,      y - cross_size),  (x,      y + cross_size), (255, 255, 255), 1, cv2.LINE_AA)
 
             # Cercle rouge + contour blanc
-            cv2.circle(frame, (x, y), 13, (0,   0,   255), -1, cv2.LINE_AA)
-            cv2.circle(frame, (x, y), 13, (255, 255, 255),  2, cv2.LINE_AA)
+            circle_size = 5
+            cv2.circle(frame, (x, y), circle_size, (0,   0,   255), -1, cv2.LINE_AA)
+            cv2.circle(frame, (x, y), circle_size, (255, 255, 255),  2, cv2.LINE_AA)
 
             # Label avec ombre
             label = (
@@ -193,22 +229,26 @@ class CalibrationWindow(QMainWindow):
     def _confirm(self):
         self._timer.stop()
 
-        # Dimensions native de la caméra pour la conversion pixel
-        ret, frame = self.camera.read()
-        if ret and frame is not None:
-            cam_h, cam_w = frame.shape[:2]
-        else:
-            cam_w, cam_h = DISPLAY_W, DISPLAY_H
+        # Dimensions natives de la caméra pour la conversion pixel → mm
+        actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Fallback si la propriété retourne 0
+        if actual_w == 0 or actual_h == 0:
+            ret, frame = self.camera.read()
+            if ret and frame is not None:
+                actual_h, actual_w = frame.shape[:2]
+            else:
+                actual_w, actual_h = CAMERA_W, CAMERA_H
 
-        sx = cam_w / DISPLAY_W
-        sy = cam_h / DISPLAY_H
+        sx = actual_w / DISPLAY_W
+        sy = actual_h / DISPLAY_H
         img_px = [[int(x * sx), int(y * sy)] for (x, y) in self.dot_px]
         phys   = self.config["physical_points"]
 
         # Homographie pixels caméra → mm
         homography = None
         try:
-            src = np.array(img_px, dtype=np.float32)
+            src = np.array(img_px,                                  dtype=np.float32)
             dst = np.array([[p["x_mm"], p["y_mm"]] for p in phys], dtype=np.float32)
             H, _ = cv2.findHomography(src, dst)
             if H is not None:
@@ -224,7 +264,7 @@ class CalibrationWindow(QMainWindow):
             "image_points_px" : img_px,
             "physical_points" : phys,
             "homography"      : homography,
-            "frame_size"      : [cam_w, cam_h],
+            "frame_size"      : [actual_w, actual_h],
             "flip_feed"       : self.flip_feed,
             "timestamp"       : datetime.now().strftime("%Y-%m-%d_%H:%M:%S.%f"),
         }
@@ -252,7 +292,9 @@ if __name__ == "__main__":
     ap.add_argument("--flip",    action="store_true")
     args = ap.parse_args()
 
-    cap = cv2.VideoCapture(args.camera)
+    # ── Ouverture caméra avec résolution forcée ────────────────────────────
+    cap = _open_camera(args.camera)
+
     if not cap.isOpened():
         print(f"[CALIB] Cannot open camera {args.camera}", file=sys.stderr)
         sys.exit(1)

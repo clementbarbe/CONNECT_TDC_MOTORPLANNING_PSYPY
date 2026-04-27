@@ -3,9 +3,10 @@
 Camera Calibration Task
 =======================
 Lance _calibration_ui.py en subprocess indépendant pour chaque surface.
-Évite tout conflit de thread Qt / PsychoPy / psychtoolbox.
+Aucune fenêtre PsychoPy n'est créée — win est accepté pour la compatibilité
+de l'API de la factory mais n'est pas utilisé.
 
-Sortie : S{session}_{table|plateau}_calibration.json  dans data_dir/
+Sortie : S{session}_{table|plateau}_calibration.json  dans data/CameraCalibration/
 """
 
 import json
@@ -14,14 +15,13 @@ import sys
 import subprocess
 import tempfile
 
-from utils.base_task import BaseTask
-
+from utils.logger import get_logger
 
 # Chemin absolu vers le script UI (même dossier que ce fichier)
 _UI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_calibration_ui.py")
 
 
-class CameraCalibrationTask(BaseTask):
+class CameraCalibrationTask:
     """Lance la calibration dans un subprocess PyQt6 dédié.
 
     Aucune dépendance à PsychoPy ou à la fenêtre principale.
@@ -30,24 +30,27 @@ class CameraCalibrationTask(BaseTask):
 
     def __init__(
         self,
-        win,
+        win,            # accepté pour compatibilité factory, non utilisé
         nom,
         session="01",
         camera_index=0,
         enregistrer=True,
         **kwargs,
     ):
-        super().__init__(
-            win=win, nom=nom, session=session,
-            task_name="CameraCalibration",
-            folder_name="calibration",
-            eyetracker_actif=False,
-            parport_actif=False,
-            enregistrer=enregistrer,
-            et_prefix="CAL",
-        )
+        # win volontairement ignoré : pas de fenêtre PsychoPy pour la calibration
+        self.nom          = str(nom)
+        self.session      = str(session)
         self.camera_index = int(camera_index)
+        self.enregistrer  = enregistrer
         self.results      = {}
+
+        self.logger = get_logger()
+
+        # Dossier de sauvegarde
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.data_dir = os.path.join(_root, "data", "CameraCalibration")
+        if self.enregistrer:
+            os.makedirs(self.data_dir, exist_ok=True)
 
         self.logger.ok("=" * 60)
         self.logger.ok("CAMERA CALIBRATION — READY")
@@ -97,12 +100,10 @@ class CameraCalibrationTask(BaseTask):
             for cal_type in calibration_types:
                 self.logger.log(f"Starting calibration: {cal_type.upper()}")
 
-                # Fichier temporaire pour recevoir le JSON du subprocess
                 tmp_path = os.path.join(
                     tempfile.gettempdir(),
                     f"calibration_{cal_type}_{os.getpid()}.json",
                 )
-                # S'assurer qu'il n'existe pas déjà
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
@@ -118,7 +119,6 @@ class CameraCalibrationTask(BaseTask):
                     cmd.append("--flip")
 
                 try:
-                    # Lance la fenêtre et attend sa fermeture (max 10 min)
                     proc = subprocess.run(cmd, timeout=600)
 
                     if proc.returncode == 0 and os.path.exists(tmp_path):
@@ -136,7 +136,10 @@ class CameraCalibrationTask(BaseTask):
                             self._save_result(result)
 
                     else:
-                        self.logger.warn(f"Calibration '{cal_type}' cancelled (code={proc.returncode}).")
+                        self.logger.warn(
+                            f"Calibration '{cal_type}' cancelled "
+                            f"(returncode={proc.returncode})."
+                        )
                         self.results[cal_type] = None
 
                 except subprocess.TimeoutExpired:
